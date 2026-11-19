@@ -1,0 +1,23 @@
+services:
+  attendance:
+    build: .
+    container_name: faceid-attendance
+    restart: unless-stopped
+    ports:
+      - "5002:5002"
+    devices:
+      - "${CAMERA_DEVICE:-/dev/video0}:${CAMERA_DEVICE:-/dev/video0}"
+    group_add:
+      - video
+    environment:
+      - MODEL_NAME=buffalo_s
+      - ATTENDANCE_TZ=Europe/Zurich
+      - LEAVE_AFTER=15:30
+      - MIN_STAY_MINUTES=1
+    volumes:
+      - ./attendance.py:/app/attendance.py:ro
+      - ./faceeid.py:/app/faceeid.py:ro
+      - ./try.py:/app/try.py:ro
+      - ./models:/app/models
+      - ./dataset:/app/dataset:ro
+      - ./data:/app/data

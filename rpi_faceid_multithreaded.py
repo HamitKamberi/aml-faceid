@@ -1,0 +1,251 @@
+import cv2
+import numpy as np
+import pickle
+import os
+import time
+import threading
+import queue
+from datetime import datetime
+from flask import Flask, Response, render_template_string
+from insightface.app import FaceAnalysis
+import subprocess
+from picamera2 import Picamera2, Preview
+import onnxruntime as ort
+
+CURRENT_MODEL = "buffalo_sc"
+CONFIG = {
+    "DB_PATH": f"embeddings_{CURRENT_MODEL}.pkl",
+    "THRESHOLD": 0.50,
+    "STREAM_WIDTH": 1920,
+    "STREAM_HEIGHT": 1080,
+    "INFER_WIDTH": 640,
+    "INFER_HEIGHT": 480,
+    "CSV_LOG_PATH": "face_log.csv",
+    "FLASK_PORT": 5000,
+    "FRAMERATE": 25,
+    "INFER_FPS": 4,
+    "STREAM_FPS": 10
+}
+
+class SharedState:
+    def __init__(self):
+        self.frame = None
+        self.frame_lock = threading.Lock()
+        self.latest_detections = []
+        self.det_lock = threading.Lock()
+        self.log_queue = queue.Queue()
+        self.running = True
+
+STATE = SharedState()
+
+class VideoCaptureThread(threading.Thread):
+    def __init__(self, state):
+        super().__init__(daemon=True)
+        self.state = state
+        self.picam2 = Picamera2()
+        config = self.picam2.create_preview_configuration(
+            main={"size": (CONFIG["STREAM_WIDTH"], CONFIG["STREAM_HEIGHT"])}
+        )
+        self.picam2.configure(config)
+        self.picam2.start()
+
+    def run(self):
+        print("Picamera2 Thread Started.")
+        while self.state.running:
+            frame = self.picam2.capture_array()
+
+            if frame.shape[2] == 4:
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR)
+            elif frame.shape[2] == 3:
+                frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+            with self.state.frame_lock:
+                self.state.frame = frame
+
+            time.sleep(0.02)
+
+class AIInferenceThread(threading.Thread):
+    def __init__(self, state):
+        super().__init__(daemon=True)
+        self.state = state
+        self.load_resources()
+        self.scale_x = CONFIG["STREAM_WIDTH"] / CONFIG["INFER_WIDTH"]
+        self.scale_y = CONFIG["STREAM_HEIGHT"] / CONFIG["INFER_HEIGHT"]
+        self.last_infer = 0
+        self.infer_interval = 1.0 / CONFIG["INFER_FPS"]
+
+    def load_resources(self):
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = 2
+        so.inter_op_num_threads = 1
+        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+
+        self.app = FaceAnalysis(
+            name=CURRENT_MODEL,
+            providers=["CPUExecutionProvider"],
+            sess_options=so
+        )
+        self.app.prepare(ctx_id=0, det_size=(CONFIG["INFER_WIDTH"], CONFIG["INFER_HEIGHT"]))
+
+        if os.path.exists(CONFIG["DB_PATH"]):
+            with open(CONFIG["DB_PATH"], "rb") as f:
+                self.db = pickle.load(f)
+        else:
+            self.db = {}
+        self.last_seen = {}
+
+    def run(self):
+        print(f"Inference Thread Started (~{CONFIG['INFER_FPS']} FPS)")
+
+        while self.state.running:
+            with self.state.frame_lock:
+                if self.state.frame is None:
+                    time.sleep(0.01)
+                    continue
+                hd_frame = self.state.frame
+
+            now = time.time()
+            if now - self.last_infer < self.infer_interval:
+                time.sleep(0.005)
+                continue
+            self.last_infer = now
+
+            small_frame = cv2.resize(hd_frame, (CONFIG["INFER_WIDTH"], CONFIG["INFER_HEIGHT"]))
+            faces = self.app.get(small_frame)
+            results = []
+
+            for face in faces:
+                bbox = face.bbox.astype(int)
+                kps = face.kps.astype(int)
+                target_emb = face.embedding / np.linalg.norm(face.embedding)
+
+                best_name = "Unknown"
+                best_score = 0
+                for name, db_data in self.db.items():
+                    score = 0
+                    if isinstance(db_data, list):
+                        for center in db_data:
+                            score = max(score, np.dot(target_emb, center.T))
+                    else:
+                        score = np.dot(target_emb, db_data.T)
+                    if score > best_score:
+                        best_score = score
+                        best_name = name
+
+                final_name = best_name if best_score > CONFIG["THRESHOLD"] else "Unknown"
+                color = (0,255,0) if final_name!="Unknown" else (0,0,255)
+
+                scaled_bbox = [
+                    int(bbox[0]*self.scale_x),
+                    int(bbox[1]*self.scale_y),
+                    int(bbox[2]*self.scale_x),
+                    int(bbox[3]*self.scale_y)
+                ]
+                scaled_kps = [(int(p[0]*self.scale_x), int(p[1]*self.scale_y)) for p in kps]
+
+                results.append({
+                    "bbox": scaled_bbox,
+                    "kps": scaled_kps,
+                    "name": final_name,
+                    "score": best_score,
+                    "color": color
+                })
+
+                if final_name != "Unknown":
+                    last = self.last_seen.get(final_name, 0)
+                    if now - last > 2:
+                        self.state.log_queue.put((final_name, best_score))
+                        self.last_seen[final_name] = now
+
+            with self.state.det_lock:
+                self.state.latest_detections = results
+
+class LoggerThread(threading.Thread):
+    def __init__(self, state):
+        super().__init__(daemon=True)
+        self.state = state
+        self.last_log = {}
+
+    def run(self):
+        if not os.path.exists(CONFIG["CSV_LOG_PATH"]):
+            with open(CONFIG["CSV_LOG_PATH"], "w") as f:
+                f.write("Time,Name,Confidence\n")
+        while self.state.running:
+            try:
+                name, score = self.state.log_queue.get(timeout=1)
+                now = datetime.now()
+                last_time = self.last_log.get(name)
+                if last_time is None or (now-last_time).total_seconds()>5:
+                    with open(CONFIG["CSV_LOG_PATH"], "a") as f:
+                        f.write(f"{now.strftime('%H:%M:%S')},{name},{score:.2f}\n")
+                    self.last_log[name] = now
+                    print(f"[LOG] {name} ({int(score*100)}%)")
+            except queue.Empty:
+                pass
+
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return render_template_string("""
+    <html>
+    <head><title>Face Recognition Stream</title></head>
+    <body style="background:black; color:white; text-align:center;">
+        <h2>Live Face Stream</h2>
+        <img src="/video_feed" style="max-width:100%;">
+        <p>Resolution: {{w}}x{{h}}</p>
+    </body>
+    </html>
+    """, w=CONFIG["STREAM_WIDTH"], h=CONFIG["STREAM_HEIGHT"])
+
+def generate_frames():
+    last_frame = 0
+    interval = 1.0 / CONFIG["STREAM_FPS"]
+    while STATE.running:
+        now = time.time()
+        if now - last_frame < interval:
+            time.sleep(0.005)
+            continue
+        last_frame = now
+
+        with STATE.frame_lock:
+            if STATE.frame is None:
+                continue
+            display_frame = STATE.frame.copy()
+
+        with STATE.det_lock:
+            detections = STATE.latest_detections
+
+        for d in detections:
+            bbox = d['bbox']
+            cv2.rectangle(display_frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), d['color'], 3)
+            label = f"{d['name']} {int(d['score']*100)}%"
+            ts = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 1, 2)[0]
+            cv2.rectangle(display_frame, (bbox[0], bbox[1]-35), (bbox[0]+ts[0]+10, bbox[1]), d['color'], -1)
+            cv2.putText(display_frame, label, (bbox[0]+5, bbox[1]-10), cv2.FONT_HERSHEY_SIMPLEX,1,(255,255,255),2)
+            for p in d['kps']:
+                cv2.circle(display_frame,p,4,(255,255,0),-1)
+
+        ret, buffer = cv2.imencode('.jpg', display_frame,[cv2.IMWRITE_JPEG_QUALITY,60])
+        frame_bytes = buffer.tobytes()
+        yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'+frame_bytes+b'\r\n')
+
+@app.route('/video_feed')
+def video_feed():
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+def main():
+    vid_t = VideoCaptureThread(STATE)
+    ai_t = AIInferenceThread(STATE)
+    log_t = LoggerThread(STATE)
+
+    vid_t.start()
+    time.sleep(1)
+    ai_t.start()
+    log_t.start()
+
+    print(f"[INFO] Server running at http://0.0.0.0:{CONFIG['FLASK_PORT']}")
+    app.run(host='0.0.0.0', port=CONFIG['FLASK_PORT'], debug=False, threaded=True)
+
+if __name__=="__main__":
+    main()

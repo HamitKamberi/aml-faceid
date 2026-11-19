@@ -1,0 +1,7 @@
+numpy<2.3
+insightface==0.7.3
+onnxruntime
+opencv-python-headless
+scikit-learn
+flask
+tzdata
